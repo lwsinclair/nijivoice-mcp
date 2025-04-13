@@ -102,8 +102,6 @@ balance = await tools.call("credit/get_credit_balance")
 nijivoice-mcp/
 ├── config.py                # 設定ファイル
 ├── debug_api.py             # APIデバッグ用スクリプト
-├── docs/                    # ドキュメント
-│   └── refactoring-plan.md  # リファクタリング計画
 ├── lib/                     # ライブラリ
 ├── logger.py                # ロギング設定
 ├── main.py                  # メインエントリーポイント
