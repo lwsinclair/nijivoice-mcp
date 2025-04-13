@@ -1,9 +1,15 @@
 [project]
 name = "nijivoice-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Model Context Protocol (MCP) implementation for NijiVoice API"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastmcp>=2.1.0",
     "mcp[cli]>=1.6.0",
+    "pydantic>=2.11.3",
+    "httpx>=0.24.0",
+    "python-dotenv>=1.0.0",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.26.0",
 ]
