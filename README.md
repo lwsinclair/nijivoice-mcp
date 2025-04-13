@@ -164,5 +164,3 @@ pytest
 ---
 
 *「Voiced by NIJI Voice」*
-
-🤖 Generated with [Claude Code](https://claude.ai/code)
