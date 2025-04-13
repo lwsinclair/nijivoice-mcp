@@ -59,14 +59,28 @@ async def test_generate_encoded_voice_success(monkeypatch):
         def __init__(self):
             self._encoded_voice = "dGVzdGRhdGE="  # base64 for "testdata"
             self.generation_time = 100
+            # URL抽出に必要な構造を追加
+            self.generated_voice = {
+                "audioFileUrl": "http://example.com/encoded_audio.mp3",
+                "duration": 200,
+                "remainingCredits": 789
+            }
+        
         def get_encoded_voice(self):
             return self._encoded_voice
+        
         def get_audio_url(self):
             return "http://example.com/encoded_audio.mp3"
+        
         def get_duration(self):
             return 200
+        
         def get_remaining_credits(self):
             return 789
+        
+        # 新しく追加するメソッド
+        def get_audio_url_first(self):
+            return "http://example.com/encoded_audio.mp3", "audioFileUrl"
     async def fake_generate_encoded_voice(voice_actor_id, request):
         return DummyResponse()
     monkeypatch.setattr(server.client, "generate_encoded_voice", fake_generate_encoded_voice)

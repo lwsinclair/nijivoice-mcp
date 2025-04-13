@@ -14,17 +14,19 @@ class NijiVoiceClient:
     
     BASE_URL = "https://api.nijivoice.com/api/platform/v1"
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, timeout: Optional[float] = 30.0):
         """
         初期化
         
         Args:
             api_key: APIキー。指定しない場合は環境変数 NIJIVOICE_API_KEY から読み込みます。
+            timeout: HTTPリクエストのタイムアウト時間（秒）
         """
         self.api_key = api_key or os.environ.get("NIJIVOICE_API_KEY")
         if not self.api_key:
             raise ValueError("APIキーが指定されていません。引数で指定するか、NIJIVOICE_API_KEY 環境変数を設定してください。")
         
+        self.timeout = timeout
         self.headers = {
             "x-api-key": self.api_key,
             "Accept": "application/json",
@@ -37,7 +39,7 @@ class NijiVoiceClient:
         Returns:
             Voice Actorのリスト
         """
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(f"{self.BASE_URL}/voice-actors", headers=self.headers)
             
             if response.status_code != 200:
@@ -51,6 +53,47 @@ class NijiVoiceClient:
                 raise NijiVoiceAPIError(f"予期しないデータ形式です: {data}", status_code=response.status_code)
                 
             return [VoiceActor.model_validate(actor) for actor in actors_data]
+    
+    async def get_voice_url(
+        self, 
+        voice_actor_id: str, 
+        request: VoiceGenerationRequest,
+    ) -> str:
+        """
+        指定されたVoice Actorの声で生成される音声ファイルのURLを取得します。
+        
+        Args:
+            voice_actor_id: Voice Actor ID
+            request: 音声生成リクエスト
+            
+        Returns:
+            音声ファイルのURL
+        """
+        url = f"{self.BASE_URL}/voice-actors/{voice_actor_id}/generate-voice"
+        
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                url, 
+                headers=self.headers,
+                json=request.model_dump(by_alias=True),
+            )
+            
+            if response.status_code != 200:
+                raise NijiVoiceAPIError(f"音声生成に失敗しました: {response.text}", status_code=response.status_code)
+            
+            data = response.json()
+            logger.debug(f"get_voice_url API response: {data}")
+            
+            generated_voice = data.get("generatedVoice", {})
+            file_url = (generated_voice.get("audioFileUrl") or 
+                       generated_voice.get("audioFileDownloadUrl") or 
+                       generated_voice.get("url") or 
+                       data.get("audioUrl"))
+            
+            if not file_url:
+                raise NijiVoiceAPIError("音声生成中にエラーが発生しました: APIレスポンスからURLを取得できませんでした。レスポンス: " + str(data))
+            
+            return file_url
     
     async def generate_voice(
         self, 
@@ -69,7 +112,7 @@ class NijiVoiceClient:
         """
         url = f"{self.BASE_URL}/voice-actors/{voice_actor_id}/generate-voice"
         
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 url, 
                 headers=self.headers,
@@ -113,8 +156,8 @@ class NijiVoiceClient:
         """
         url = f"{self.BASE_URL}/voice-actors/{voice_actor_id}/generate-encoded-voice"
         
-        # タイムアウト時間を長く設定（30秒など）またはタイムアウトを指定しない
-        async with httpx.AsyncClient(timeout=30) as client:
+        # タイムアウト設定を適用
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 url, 
                 headers=self.headers,
@@ -158,7 +201,7 @@ class NijiVoiceClient:
         Returns:
             クレジット残高
         """
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(f"{self.BASE_URL}/balances", headers=self.headers)
             
             if response.status_code != 200:

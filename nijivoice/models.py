@@ -170,6 +170,31 @@ class EncodedVoiceResponse(BaseModel):
                 return self.generated_voice["remainingCredits"]
         
         return None
+    
+    def get_audio_url_first(self) -> Optional[tuple]:
+        """URLを最優先で探し、見つかった場合はURLとフィールド名を返す"""
+        url_fields = [
+            "audioFileUrl",
+            "audioFileDownloadUrl", 
+            "url", 
+            "fileUrl", 
+            "audioUrl"
+        ]
+        
+        # 1. generated_voiceを確認
+        if self.generated_voice and isinstance(self.generated_voice, dict):
+            for field in url_fields:
+                if field in self.generated_voice and self.generated_voice[field]:
+                    return self.generated_voice[field], field
+            
+            # ネストされた構造を確認
+            for key, value in self.generated_voice.items():
+                if isinstance(value, dict):
+                    for field in url_fields:
+                        if field in value and value[field]:
+                            return value[field], f"{key}.{field}"
+        
+        return None, None
 
 class Balance(BaseModel):
     """クレジット残高モデル"""
@@ -205,3 +230,4 @@ class Balance(BaseModel):
         # どのフィールドにも残高情報がない場合
         logger.warning("クレジット残高情報が見つかりませんでした")
         return 0
+    

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import httpx
 import json
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from fastmcp import FastMCP, Context
 from nijivoice.api import NijiVoiceClient
 from nijivoice.models import VoiceGenerationRequest, VoiceActor, Balance
@@ -30,6 +30,123 @@ client = NijiVoiceClient(api_key=api_key)
 
 # MCPサーバーの作成
 mcp = FastMCP("NijiVoice MCP")
+
+# タイムアウト時間をスクリプトの長さに応じて動的に設定
+def calculate_timeout(script_length, base_timeout=30.0, char_factor=0.01):
+    """スクリプトの長さに応じたタイムアウト時間を計算"""
+    # 基本のタイムアウト + スクリプトの長さに応じた追加時間
+    # 例: 1000文字のスクリプトなら、base_timeout + 10秒
+    return min(base_timeout + (script_length * char_factor), 120.0)  # 最大2分
+
+async def retry_async(func, *args, max_retries=3, base_delay=2.0, **kwargs):
+    """非同期関数のリトライ処理を行うヘルパー関数"""
+    retries = 0
+    last_exception = None
+    
+    while retries < max_retries:
+        try:
+            return await func(*args, **kwargs)
+        except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+            last_exception = e
+            retries += 1
+            logger.warning(f"リトライ {retries}/{max_retries}: {str(e)}")
+            
+            if retries < max_retries:
+                # 指数バックオフ（リトライごとに待機時間を増加）
+                wait_time = base_delay * (2 ** (retries - 1))
+                logger.info(f"{wait_time}秒後にリトライします...")
+                await asyncio.sleep(wait_time)
+    
+    # 最大リトライ回数に達した場合
+    logger.error(f"最大リトライ回数（{max_retries}回）に達しました: {str(last_exception)}")
+    raise last_exception
+
+async def extract_audio_url_from_response(response) -> Tuple[Optional[str], Optional[str]]:
+    """レスポンスから音声URLを優先的に抽出する関数"""
+    # デバッグ用にレスポンス構造をログ出力
+    logger.debug(f"レスポンス構造分析: {type(response).__name__}")
+    
+    # 優先順位の高いURLフィールド
+    url_fields = [
+        "audioFileUrl",        # 最優先
+        "audioFileDownloadUrl",
+        "url",
+        "downloadUrl",
+        "fileUrl",
+        "audioUrl"
+    ]
+    
+    # 1. generated_voice属性から直接検索
+    if hasattr(response, 'generated_voice') and isinstance(response.generated_voice, dict):
+        gv = response.generated_voice
+        logger.debug(f"generated_voice キー: {list(gv.keys())}")
+        
+        # URLフィールドを優先順位順に検索
+        for field in url_fields:
+            if field in gv and gv[field]:
+                url = gv[field]
+                logger.info(f"URLを検出: {field}={url}")
+                return url, field
+    
+    # 2. キャメルケース対応（generatedVoice）
+    if hasattr(response, 'generatedVoice') and isinstance(response.generatedVoice, dict):
+        gv = response.generatedVoice
+        logger.debug(f"generatedVoice キー: {list(gv.keys())}")
+        
+        for field in url_fields:
+            if field in gv and gv[field]:
+                url = gv[field]
+                logger.info(f"キャメルケースURLを検出: {field}={url}")
+                return url, f"camel_{field}"
+    
+    # 3. model_dumpを使用（Pydantic v2対応）
+    if hasattr(response, 'model_dump'):
+        try:
+            raw_data = response.model_dump()
+            logger.debug(f"model_dump キー: {list(raw_data.keys())}")
+            
+            for gv_key in ['generatedVoice', 'generated_voice']:
+                if gv_key in raw_data and isinstance(raw_data[gv_key], dict):
+                    gv = raw_data[gv_key]
+                    logger.debug(f"{gv_key} in raw_data keys: {list(gv.keys())}")
+                    
+                    for field in url_fields:
+                        if field in gv and gv[field]:
+                            url = gv[field]
+                            logger.info(f"model_dumpからURLを検出: {gv_key}.{field}={url}")
+                            return url, f"dump_{field}"
+        except Exception as e:
+            logger.warning(f"model_dumpからのデータ取得に失敗: {str(e)}")
+    
+    # 4. ネストされた構造を探索
+    for attr_name in ['generated_voice', 'generatedVoice']:
+        if hasattr(response, attr_name):
+            attr_value = getattr(response, attr_name)
+            if isinstance(attr_value, dict):
+                # 主要なネスト構造を探索
+                for nested_key in ['audioData', 'data']:
+                    if nested_key in attr_value and isinstance(attr_value[nested_key], dict):
+                        nested = attr_value[nested_key]
+                        logger.debug(f"{nested_key} keys: {list(nested.keys())}")
+                        
+                        for field in url_fields:
+                            if field in nested and nested[field]:
+                                url = nested[field]
+                                logger.info(f"ネスト構造からURLを検出: {nested_key}.{field}={url}")
+                                return url, f"{nested_key}.{field}"
+                
+                # その他のネスト構造を探索
+                for key, value in attr_value.items():
+                    if isinstance(value, dict):
+                        for field in url_fields:
+                            if field in value and value[field]:
+                                url = value[field]
+                                logger.info(f"その他のネスト構造からURLを検出: {key}.{field}={url}")
+                                return url, f"{key}.{field}"
+    
+    # URLが見つからなかった場合
+    logger.warning("レスポンスから音声URLを検出できませんでした")
+    return None, None
 
 @mcp.tool(name="get_voice_actors")
 async def get_voice_actors() -> List[VoiceActor]:
@@ -98,264 +215,51 @@ async def generate_voice(
             "file_type": f"audio/{format}"
         }
         
-        # エンコード音声APIを呼び出し（10秒のタイムアウトを設定）
+        # スクリプトの長さに応じたタイムアウト時間の計算
+        timeout = calculate_timeout(len(script))
+        logger.info(f"APIリクエスト開始: voice_actor_id={voice_actor_id}, スクリプト長={len(script)}, タイムアウト={timeout}秒")
+        
+        # リトライ付きAPIリクエスト - get_voice_urlを使用
         try:
+            # get_voice_urlメソッドを呼び出す
             logger.info(f"APIへのリクエスト開始: voice_actor_id={voice_actor_id}, スクリプト長={len(script)}")
-            try:
-                response = await asyncio.wait_for(
-                    client.generate_encoded_voice(voice_actor_id, request), 
-                    timeout=10.0
-                )
-                logger.info("APIリクエスト成功: レスポンス取得")
-            except asyncio.TimeoutError:
-                logger.error("APIリクエストがタイムアウトしました（10秒）")
-                raise ValueError("APIリクエストが10秒でタイムアウトしました。サーバーの負荷が高いか、ネットワークの問題が発生しています。")
+            audio_url = await retry_async(
+                client.get_voice_url,
+                voice_actor_id,
+                request,
+                max_retries=3,
+                base_delay=2.0
+            )
+            logger.info("APIリクエスト成功: URL取得")
             
-            # レスポンス全体をログに出力（デバッグ目的）
-            logger.debug(f"API Response structure: {response.model_dump()}")
+            # URLが取得できた場合は必ずそれを使用
+            if audio_url:
+                logger.info(f"Using audio URL from direct API call: {audio_url}")
+                result.update({
+                    "audio_url": audio_url,
+                    "url_source": "direct_api_call",
+                    "message": "APIから直接取得した音声URLです"
+                })
+                return result  # ここで早期リターン
             
-            # より詳細なレスポンス解析を追加
-            if hasattr(response, 'generated_voice'):
-                if isinstance(response.generated_voice, dict):
-                    logger.info(f"generated_voice keys: {list(response.generated_voice.keys())}")
-                    
-                    # audioFileUrl を優先的に使用
-                    if "audioFileUrl" in response.generated_voice:
-                        url = response.generated_voice["audioFileUrl"]
-                        logger.info(f"APIレスポンスからaudioFileUrl取得: {url}")
-                        result.update({
-                            "audio_url": url,
-                            "url_source": "api_audioFileUrl",
-                            "duration": response.generated_voice.get("duration"),
-                            "remaining_credits": response.generated_voice.get("remainingCredits"),
-                            "message": "APIレスポンスから取得した音声URLです"
-                        })
-                        return result
-                    
-                    # audioFileDownloadUrl があれば使用
-                    if "audioFileDownloadUrl" in response.generated_voice:
-                        url = response.generated_voice["audioFileDownloadUrl"]
-                        logger.info(f"APIレスポンスからaudioFileDownloadUrl取得: {url}")
-                        result.update({
-                            "audio_url": url,
-                            "url_source": "api_audioFileDownloadUrl",
-                            "duration": response.generated_voice.get("duration"),
-                            "remaining_credits": response.generated_voice.get("remainingCredits"),
-                            "message": "APIレスポンスから取得した音声ダウンロードURLです"
-                        })
-                        return result
-                    
-                    # base64Audio があれば使用（base64文字列からdata URLを生成）
-                    if "base64Audio" in response.generated_voice:
-                        base64_audio = response.generated_voice["base64Audio"]
-                        url = f"data:audio/{format};base64," + base64_audio
-                        logger.info(f"APIレスポンスからbase64Audio取得: {url}")
-                        result.update({
-                            "audio_url": url,
-                            "url_source": "api_base64Audio",
-                            "duration": response.generated_voice.get("duration"),
-                            "remaining_credits": response.generated_voice.get("remainingCredits"),
-                            "message": "APIレスポンスから取得した音声URL（base64）です"
-                        })
-                        return result
-
-                        # 他の可能性のあるURLキーを探す（API仕様変更に対応）
-                    for key in ["url", "downloadUrl", "fileUrl", "audioUrl"]:
-                        if key in response.generated_voice:
-                            url = response.generated_voice[key]
-                            logger.info(f"APIレスポンスから代替URL({key})取得: {url}")
-                            result.update({
-                                "audio_url": url,
-                                "url_source": f"api_{key}",
-                                "duration": response.generated_voice.get("duration"),
-                                "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                "message": f"APIレスポンスから取得した代替音声URL({key})です"
-                            })
-                            return result
-                    
-                    # audioDataフィールドがあればそこから探索（新API構造対応）
-                    if "audioData" in response.generated_voice:
-                        audio_data = response.generated_voice["audioData"]
-                        logger.info(f"audioDataフィールドを検出しました: {type(audio_data)}")
-                        
-                        # audioDataが辞書の場合
-                        if isinstance(audio_data, dict):
-                            logger.info(f"audioData keys: {list(audio_data.keys())}")
-                            # 一般的なURLキーを探す
-                            for url_key in ["url", "downloadUrl", "fileUrl", "audioUrl", "audioFileUrl", "audioFileDownloadUrl"]:
-                                if url_key in audio_data:
-                                    url = audio_data[url_key]
-                                    logger.info(f"audioDataフィールド内からURL({url_key})取得: {url}")
-                                    result.update({
-                                        "audio_url": url,
-                                        "url_source": f"audioData_{url_key}",
-                                        "duration": audio_data.get("duration") or response.generated_voice.get("duration"),
-                                        "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                        "message": f"audioDataフィールド内から取得した音声URL({url_key})です"
-                                    })
-                                    return result
-                        # audioDataが文字列の場合、それ自体がURLかもしれない
-                        elif isinstance(audio_data, str) and (audio_data.startswith("http://") or audio_data.startswith("https://")):
-                            logger.info(f"audioDataフィールドに直接URLが含まれていました: {audio_data}")
-                            result.update({
-                                "audio_url": audio_data,
-                                "url_source": "audioData_direct",
-                                "duration": response.generated_voice.get("duration"),
-                                "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                "message": "audioDataフィールドから直接取得した音声URLです"
-                            })
-                            return result
-                    
-                    # dataフィールドがあればそこから探索（さらに新しい可能性のある構造）
-                    if "data" in response.generated_voice:
-                        data_field = response.generated_voice["data"]
-                        logger.info(f"dataフィールドを検出しました: {type(data_field)}")
-                        
-                        # dataが辞書の場合
-                        if isinstance(data_field, dict):
-                            logger.info(f"data keys: {list(data_field.keys())}")
-                            # 一般的なURLキーを探す
-                            for url_key in ["url", "downloadUrl", "fileUrl", "audioUrl", "audioFileUrl", "audioFileDownloadUrl"]:
-                                if url_key in data_field:
-                                    url = data_field[url_key]
-                                    logger.info(f"dataフィールド内からURL({url_key})取得: {url}")
-                                    result.update({
-                                        "audio_url": url,
-                                        "url_source": f"data_{url_key}",
-                                        "duration": data_field.get("duration") or response.generated_voice.get("duration"),
-                                        "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                        "message": f"dataフィールド内から取得した音声URL({url_key})です"
-                                    })
-                                    return result
-                        # dataが文字列の場合、それ自体がURLかもしれない
-                        elif isinstance(data_field, str) and (data_field.startswith("http://") or data_field.startswith("https://")):
-                            logger.info(f"dataフィールドに直接URLが含まれていました: {data_field}")
-                            result.update({
-                                "audio_url": data_field,
-                                "url_source": "data_direct",
-                                "duration": response.generated_voice.get("duration"),
-                                "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                "message": "dataフィールドから直接取得した音声URLです"
-                            })
-                            return result
-                    
-                    # ネストされた構造を確認
-                    for nested_key, value in response.generated_voice.items():
-                        if isinstance(value, dict):
-                            logger.info(f"Checking nested structure: {nested_key}, keys: {list(value.keys())}")
-                            for url_key in ["url", "downloadUrl", "fileUrl", "audioUrl", "audioFileUrl", "audioFileDownloadUrl"]:
-                                if url_key in value:
-                                    url = value[url_key]
-                                    logger.info(f"APIレスポンスからネストされたURL({nested_key}.{url_key})取得: {url}")
-                                    result.update({
-                                        "audio_url": url,
-                                        "url_source": f"api_nested_{nested_key}_{url_key}",
-                                        "duration": response.generated_voice.get("duration"),
-                                        "remaining_credits": response.generated_voice.get("remainingCredits"),
-                                        "message": f"APIレスポンスから取得したネスト構造内の音声URL({nested_key}.{url_key})です"
-                                    })
-                                    return result
-                    
-                    # URLが見つからない場合はレスポンスをダンプしてエラーを発生させる
-                    logger.error("APIレスポンスにURLらしきものが見つかりませんでした。レスポンス全体をダンプします:")
-                    logger.error(json.dumps(response.generated_voice, default=str))
-                    raise ValueError("APIレスポンスからURLを取得できませんでした。API仕様が変更されたかエラーが発生した可能性があります。")
-                else:
-                    # generated_voiceが辞書でない場合
-                    logger.error(f"generated_voice is not a dict: {type(response.generated_voice)}")
-                    logger.error(f"generated_voice content: {response.generated_voice}")
-                    raise ValueError(f"不正なAPIレスポンス形式です: generated_voice が辞書ではありません（{type(response.generated_voice)}）")
-            # キャメルケースのgeneratedVoiceにも対応
-            elif hasattr(response, 'generatedVoice'):
-                if isinstance(response.generatedVoice, dict):
-                    logger.info(f"generatedVoice keys: {list(response.generatedVoice.keys())}")
-                    
-                    # audioFileUrl を優先的に使用
-                    if "audioFileUrl" in response.generatedVoice:
-                        url = response.generatedVoice["audioFileUrl"]
-                        logger.info(f"APIレスポンスからaudioFileUrl取得（キャメルケース）: {url}")
-                        result.update({
-                            "audio_url": url,
-                            "url_source": "api_audioFileUrl_camel",
-                            "duration": response.generatedVoice.get("duration"),
-                            "remaining_credits": response.generatedVoice.get("remainingCredits"),
-                            "message": "APIレスポンスから取得した音声URL（キャメルケース）です"
-                        })
-                        return result
-                    
-                    # audioFileDownloadUrl があれば使用
-                    if "audioFileDownloadUrl" in response.generatedVoice:
-                        url = response.generatedVoice["audioFileDownloadUrl"]
-                        logger.info(f"APIレスポンスからaudioFileDownloadUrl取得（キャメルケース）: {url}")
-                        result.update({
-                            "audio_url": url,
-                            "url_source": "api_audioFileDownloadUrl_camel",
-                            "duration": response.generatedVoice.get("duration"),
-                            "remaining_credits": response.generatedVoice.get("remainingCredits"),
-                            "message": "APIレスポンスから取得した音声ダウンロードURL（キャメルケース）です"
-                        })
-                        return result
-                else:
-                    # generatedVoiceが辞書でない場合
-                    logger.error(f"generatedVoice is not a dict: {type(response.generatedVoice)}")
-                    logger.error(f"generatedVoice content: {response.generatedVoice}")
-                    raise ValueError(f"不正なAPIレスポンス形式です: generatedVoice が辞書ではありません（{type(response.generatedVoice)}）")
-            else:
-                # generated_voice属性がない場合
-                logger.error("Response does not have generated_voice attribute")
-                logger.error(f"Response available attributes: {dir(response)}")
-                raise ValueError("APIレスポンスにgenerated_voice属性がありません。API仕様が変更された可能性があります。")
+            # URLが取得できなかった場合（通常はここに到達しない）
+            logger.error("get_voice_urlからURLを取得できませんでした")
+            raise ValueError("音声生成中にエラーが発生しました: APIから音声URLを取得できませんでした")
             
-            # model_dump()メソッドを使ってraw dictを取得してみる（Pydanticモデル対応）
-            if hasattr(response, 'model_dump'):
-                try:
-                    raw_data = response.model_dump()
-                    logger.info(f"モデルダンプからデータ取得: {list(raw_data.keys())}")
-                    
-                    # generatedVoiceキーを確認
-                    if "generatedVoice" in raw_data and isinstance(raw_data["generatedVoice"], dict):
-                        gv = raw_data["generatedVoice"]
-                        logger.info(f"Raw generatedVoice keys: {list(gv.keys())}")
-                        
-                        if "audioFileUrl" in gv:
-                            url = gv["audioFileUrl"]
-                            logger.info(f"Rawデータからaudioファイルのurl: {url}")
-                            result.update({
-                                "audio_url": url,
-                                "url_source": "raw_generatedVoice_audioFileUrl",
-                                "duration": gv.get("duration"),
-                                "remaining_credits": gv.get("remainingCredits"),
-                                "message": "Raw APIレスポンスから取得した音声URLです"
-                            })
-                            return result
-                        elif "audioFileDownloadUrl" in gv:
-                            url = gv["audioFileDownloadUrl"]
-                            logger.info(f"Rawデータからaudioファイルのダウンロードurl: {url}")
-                            result.update({
-                                "audio_url": url,
-                                "url_source": "raw_generatedVoice_audioFileDownloadUrl",
-                                "duration": gv.get("duration"),
-                                "remaining_credits": gv.get("remainingCredits"),
-                                "message": "Raw APIレスポンスから取得した音声ダウンロードURLです"
-                            })
-                            return result
-                except Exception as e:
-                    logger.warning(f"model_dumpからのデータ取得に失敗: {str(e)}")
-        except asyncio.TimeoutError:
-            # タイムアウトエラーは上でキャッチしているが、念のためここでも
-            logger.error("APIリクエストがタイムアウトしました（10秒）")
-            raise ValueError("APIリクエストが10秒でタイムアウトしました。サーバーの負荷が高いか、ネットワークの問題が発生しています。")
+            raise ValueError("APIレスポンスから音声データを取得できませんでした。API仕様が変更された可能性があります。")
+            
+        except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+            # タイムアウトエラー
+            logger.error(f"APIリクエストがタイムアウトしました: {str(e)}")
+            raise ValueError(f"APIリクエストがタイムアウトしました。サーバーの負荷が高いか、スクリプトが長すぎる可能性があります。")
         except Exception as e:
-            # エラー詳細をログに記録
-            logger.error(f"エンコード音声APIからURLを取得できませんでした: {str(e)}", exc_info=True)
-            logger.error(f"詳細なエラー情報: {type(e).__name__}: {str(e)}")
-            
-            # このエラーをそのまま上位に伝播させる（ローカルファイル生成によるフォールバック処理は行わない）
+            # その他のエラー
+            logger.error(f"APIリクエスト中にエラーが発生しました: {str(e)}", exc_info=True)
             raise ValueError(f"音声生成に失敗しました: {str(e)}")
     except Exception as e:
         # エラーメッセージを詳細に返す
         error_message = f"音声生成中にエラーが発生しました: {str(e)}"
-        logger.error(error_message)
+        logger.error(error_message, exc_info=True)
         raise ValueError(error_message)
 
 @mcp.tool(name="generate_encoded_voice")
@@ -397,126 +301,157 @@ async def generate_encoded_voice(
             format=format,
         )
         
-        # 10秒のタイムアウトを設定してAPIを呼び出し
+        # スクリプトの長さに応じたタイムアウト時間の計算
+        timeout = calculate_timeout(len(script))
+        logger.info(f"APIリクエスト開始: voice_actor_id={voice_actor_id}, スクリプト長={len(script)}, タイムアウト={timeout}秒")
+        
+        # リトライ機能付きAPIリクエスト
         try:
-            logger.info(f"APIへのリクエスト開始: voice_actor_id={voice_actor_id}, スクリプト長={len(script)}")
-            response = await asyncio.wait_for(
-                client.generate_encoded_voice(voice_actor_id, request),
-                timeout=10.0
+            response = await retry_async(
+                client.generate_encoded_voice,
+                voice_actor_id,
+                request,
+                max_retries=3,
+                base_delay=2.0
             )
             logger.info("APIリクエスト成功: レスポンス取得")
-        except asyncio.TimeoutError:
-            logger.error("APIリクエストがタイムアウトしました（10秒）")
-            raise ValueError("APIリクエストが10秒でタイムアウトしました。サーバーの負荷が高いか、ネットワークの問題が発生しています。")
-        
-        # 異なるレスポンス形式に対応
-        encoded_voice = response.get_encoded_voice()
-        if encoded_voice is not None:
-            # Base64データのメタ情報を返す
-            data_size = len(encoded_voice)
-            data_preview = encoded_voice[:30] + "..." if len(encoded_voice) > 30 else encoded_voice
             
-            # APIから返されるURLを取得
-            audio_url = response.get_audio_url()
-            audio_duration = response.get_duration()
-            remaining_credits = response.get_remaining_credits()
-            
-            # URLが取得できた場合はファイルに保存せずURLを返す
-            if audio_url:
-                logger.info(f"APIから返されたオーディオURL: {audio_url}")
-                return {
-                    "status": "success",
-                    "voice_actor_id": voice_actor_id,
-                    "format": format,
-                    "data_size_bytes": data_size,
-                    "data_preview": data_preview,
-                    "audio_url": audio_url,
-                    "duration_ms": audio_duration,
-                    "script_length": len(script),
-                    "remaining_credits": remaining_credits,
-                    "message": f"音声生成に成功しました。サイズ: {data_size} バイト, 形式: {format}, URL: {audio_url}"
-                }
-            
-            # URLが取得できない場合は一時ファイルに保存（従来の方法）
-            fd, temp_path = tempfile.mkstemp(suffix=f".{format}")
-            try:
-                import base64
-                
-                # Base64データの前処理
-                # //で始まる場合は特殊なフォーマットなので修正
-                processed_data = encoded_voice
-                if encoded_voice.startswith("//"):
-                    logger.debug("特殊な形式のBase64データを検出しました。修正を試みます。")
-                    # よく使われる置換パターンを試す
-                    processed_data = encoded_voice.replace('-', '+').replace('_', '/')
-                    # パディングの修正
-                    padding = 4 - (len(processed_data) % 4) if len(processed_data) % 4 else 0
-                    processed_data += "=" * padding
-                
-                # デコード処理を実行
+            # レスポンスの生データをダンプしてデバッグ
+            logger.debug(f"==== API RESPONSE DEBUG ====")
+            if hasattr(response, 'model_dump'):
                 try:
-                    logger.debug(f"Base64デコードを実行します。データ長: {len(processed_data)}")
-                    decoded_data = base64.b64decode(processed_data)
-                    logger.debug(f"デコード成功: {len(decoded_data)} バイト")
-                    with os.fdopen(fd, 'wb') as f:
-                        f.write(decoded_data)
-                except base64.binascii.Error as e:
-                    # 標準的なデコードに失敗した場合は、異なる方法を試す
-                    logger.warning(f"標準的なBase64デコードに失敗しました: {str(e)}")
-                    if "Incorrect padding" in str(e):
-                        try:
-                            padded_data = processed_data + "=="  # 最大パディングを追加
-                            decoded_data = base64.b64decode(padded_data)
-                            logger.debug(f"パディング追加後のデコード成功: {len(decoded_data)} バイト")
-                            with os.fdopen(fd, 'wb') as f:
-                                f.write(decoded_data)
-                        except Exception as e2:
-                            raise Exception(f"パディング追加後もBase64デコードに失敗しました: {str(e2)}")
-                    else:
-                        raise
-            except Exception as e:
-                logger.error(f"音声データのデコードまたは保存に失敗しました: {str(e)}")
-                os.close(fd)
-                os.unlink(temp_path)
-                temp_path = None
-            
-            # 絶対URLに変換
-            base_url = os.environ.get("NIJIVOICE_FILE_SERVER_URL", "http://localhost:8000/files")
-            file_name = os.path.basename(temp_path) if temp_path else None
-            full_url = f"{base_url}/{file_name}" if file_name else None
-            
-            if full_url:
-                logger.info(f"生成された音声ファイル: {file_name}, URL: {full_url}")
-            
-            return {
-                "status": "success",
-                "voice_actor_id": voice_actor_id,
-                "format": format,
-                "data_size_bytes": data_size,
-                "data_preview": data_preview,
-                "file_path": temp_path,
-                "file_url": full_url,  # URLを追加
-                "script_length": len(script),
-                "generation_time": response.generation_time if hasattr(response, 'generation_time') else None,
-                "message": f"音声生成に成功しました。サイズ: {data_size} バイト, 形式: {format}, URL: {full_url}"
-            }
-        else:
-            # デバッグ情報をログに出力
-            logger.debug(f"Response object: {response}")
-            if response.generated_voice:
-                logger.debug(f"generated_voice content: {response.generated_voice}")
-            
-            # エラーが発生した場合
-            raise ValueError("エンコード音声を取得できませんでした。APIのレスポンス構造が変わった可能性があります。ログファイル(nijivoice_mcp.log)を確認してください。")
-    except asyncio.TimeoutError:
-        # タイムアウトエラーは上でキャッチしているが、念のためここでも
-        error_message = "APIリクエストが10秒でタイムアウトしました。サーバーの負荷が高いか、ネットワークの問題が発生しています。"
-        logger.error(error_message)
-        raise ValueError(error_message)
+                    raw_model = response.model_dump()
+                    logger.debug(f"Model dump: {json.dumps(raw_model, default=str)[:1000]}")
+                except Exception as e:
+                    logger.debug(f"Model dump failed: {str(e)}")
+
+            if hasattr(response, 'generated_voice'):
+                logger.debug(f"Generated voice: {type(response.generated_voice)}")
+                if isinstance(response.generated_voice, dict):
+                    logger.debug(f"Generated voice keys: {list(response.generated_voice.keys())}")
+            logger.debug(f"==== END API RESPONSE DEBUG ====")
+
+            # EncodedVoiceResponseの新メソッドを使用してURLを取得
+            audio_url, url_field = None, None
+            if hasattr(response, 'get_audio_url_first'):
+                audio_url, url_field = response.get_audio_url_first()
+                if audio_url:
+                    logger.info(f"Direct URL found in response: {url_field}={audio_url}")
+
+            # URLが見つからない場合はヘルパー関数で検索
+            if not audio_url:
+                audio_url, url_field = await extract_audio_url_from_response(response)
+                if audio_url:
+                    logger.info(f"URL found via helper: {url_field}={audio_url}")
+
+            # URLが見つかった場合は必ずそれを使用
+            if audio_url:
+                logger.info(f"Using audio URL: {url_field}={audio_url}")
+                # 基本的なレスポンス構造を準備
+                result = {
+                    "status": "success",
+                    "script": script,
+                    "format": format,
+                    "voice_actor_id": voice_actor_id,
+                    "file_type": f"audio/{format}"
+                }
+                result.update({
+                    "audio_url": audio_url,
+                    "url_source": url_field,
+                    "duration": (
+                        response.generated_voice.get("duration") 
+                        if hasattr(response, 'generated_voice') 
+                        else getattr(response, 'generatedVoice', {}).get("duration")
+                    ),
+                    "remaining_credits": (
+                        response.generated_voice.get("remainingCredits") 
+                        if hasattr(response, 'generated_voice') 
+                        else getattr(response, 'generatedVoice', {}).get("remainingCredits")
+                    ),
+                    "message": f"APIレスポンスから取得した音声URL（{url_field}）です"
+                })
+                return result  # ここで早期リターン
+                
+                # URLが無い場合はbase64データを使用
+                # 一時ファイルに保存する処理は残しておく
+                fd, temp_path = tempfile.mkstemp(suffix=f".{format}")
+                try:
+                    import base64
+                    
+                    # Base64データの前処理
+                    # //で始まる場合は特殊なフォーマットなので修正
+                    processed_data = encoded_voice
+                    if encoded_voice.startswith("//"):
+                        logger.debug("特殊な形式のBase64データを検出しました。修正を試みます。")
+                        # よく使われる置換パターンを試す
+                        processed_data = encoded_voice.replace('-', '+').replace('_', '/')
+                        # パディングの修正
+                        padding = 4 - (len(processed_data) % 4) if len(processed_data) % 4 else 0
+                        processed_data += "=" * padding
+                    
+                    # デコード処理を実行
+                    try:
+                        logger.debug(f"Base64デコードを実行します。データ長: {len(processed_data)}")
+                        decoded_data = base64.b64decode(processed_data)
+                        logger.debug(f"デコード成功: {len(decoded_data)} バイト")
+                        with os.fdopen(fd, 'wb') as f:
+                            f.write(decoded_data)
+                    except base64.binascii.Error as e:
+                        # 標準的なデコードに失敗した場合は、異なる方法を試す
+                        logger.warning(f"標準的なBase64デコードに失敗しました: {str(e)}")
+                        if "Incorrect padding" in str(e):
+                            try:
+                                padded_data = processed_data + "=="  # 最大パディングを追加
+                                decoded_data = base64.b64decode(padded_data)
+                                logger.debug(f"パディング追加後のデコード成功: {len(decoded_data)} バイト")
+                                with os.fdopen(fd, 'wb') as f:
+                                    f.write(decoded_data)
+                            except Exception as e2:
+                                raise Exception(f"パディング追加後もBase64デコードに失敗しました: {str(e2)}")
+                        else:
+                            raise
+                except Exception as e:
+                    logger.error(f"音声データのデコードまたは保存に失敗しました: {str(e)}")
+                    os.close(fd)
+                    os.unlink(temp_path)
+                    temp_path = None
+                
+                # 絶対URLに変換
+                base_url = os.environ.get("NIJIVOICE_FILE_SERVER_URL", "http://localhost:8000/files")
+                file_name = os.path.basename(temp_path) if temp_path else None
+                full_url = f"{base_url}/{file_name}" if file_name else None
+                
+                if full_url:
+                    logger.info(f"生成された音声ファイル: {file_name}, URL: {full_url}")
+                
+                result.update({
+                    "file_path": temp_path,
+                    "file_url": full_url,  # URLを追加
+                    "message": f"音声生成に成功しました。サイズ: {data_size} バイト, 形式: {format}, URL: {full_url}"
+                })
+                return result
+            else:
+                # デバッグ情報をログに出力
+                logger.debug(f"Response object: {response}")
+                if hasattr(response, 'generated_voice') and response.generated_voice:
+                    logger.debug(f"generated_voice content: {response.generated_voice}")
+                
+                # エラーが発生した場合
+                raise ValueError("エンコード音声を取得できませんでした。APIのレスポンス構造が変わった可能性があります。ログファイル(nijivoice_mcp.log)を確認してください。")
+        except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+            # タイムアウトエラー
+            error_message = f"APIリクエストがタイムアウトしました: {str(e)}。サーバーの負荷が高いか、スクリプトが長すぎる可能性があります。"
+            logger.error(error_message)
+            raise ValueError(error_message)
+        except Exception as e:
+            # エラーメッセージを詳細に返す
+            error_message = f"音声生成中にエラーが発生しました: {str(e)}"
+            logger.error(error_message, exc_info=True)
+            raise ValueError(error_message)
     except Exception as e:
         # エラーメッセージを詳細に返す
         error_message = f"音声生成中にエラーが発生しました: {str(e)}"
-        logger.error(error_message)
+        logger.error(error_message, exc_info=True)
         raise ValueError(error_message)
 
 @mcp.tool(name="get_credit_balance")
