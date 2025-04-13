@@ -84,16 +84,44 @@ class NijiVoiceClient:
             data = response.json()
             logger.debug(f"get_voice_url API response: {data}")
             
-            generated_voice = data.get("generatedVoice", {})
-            file_url = (generated_voice.get("audioFileUrl") or 
-                       generated_voice.get("audioFileDownloadUrl") or 
-                       generated_voice.get("url") or 
-                       data.get("audioUrl"))
+            # URLを抽出する共通関数を使用
+            file_url = self._extract_url_from_response(data)
             
             if not file_url:
                 raise NijiVoiceAPIError("音声生成中にエラーが発生しました: APIレスポンスからURLを取得できませんでした。レスポンス: " + str(data))
             
             return file_url
+            
+    def _extract_url_from_response(self, data: dict) -> str:
+        """レスポンスから音声URLを抽出する共通関数"""
+        if not data:
+            return None
+            
+        # generatedVoiceオブジェクト内を検索
+        generated_voice = data.get("generatedVoice", {})
+        
+        # 優先順位順にURLを検索
+        for field in ["audioFileUrl", "audioFileDownloadUrl", "url", "downloadUrl", "fileUrl", "audioUrl"]:
+            # 直接generatedVoice内を検索
+            if field in generated_voice and generated_voice[field]:
+                return generated_voice[field]
+            
+            # トップレベルも検索
+            if field in data and data[field]:
+                return data[field]
+                
+        # audioUrlがトップレベルにある場合
+        if "audioUrl" in data:
+            return data["audioUrl"]
+            
+        # ネストされた構造を検索
+        for key, value in generated_voice.items():
+            if isinstance(value, dict):
+                for field in ["url", "fileUrl", "audioUrl", "audioFileUrl", "audioFileDownloadUrl"]:
+                    if field in value and value[field]:
+                        return value[field]
+        
+        return None
     
     async def generate_voice(
         self, 
@@ -124,11 +152,9 @@ class NijiVoiceClient:
             
             data = response.json()
             logger.debug("generate_voice API response: %s", data)
-            generated_voice = data.get("generatedVoice", {})
-            file_url = (generated_voice.get("audioFileUrl") or 
-                        generated_voice.get("audioFileDownloadUrl") or 
-                        generated_voice.get("url") or 
-                        data.get("audioUrl"))
+            
+            # 共通のURL抽出関数を使用
+            file_url = self._extract_url_from_response(data)
             
             if not file_url:
                 raise NijiVoiceAPIError("音声生成中にエラーが発生しました: APIレスポンスからURLを取得できませんでした。レスポンス: " + str(data))

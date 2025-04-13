@@ -1,0 +1,15 @@
+# コードオーナーの定義
+# リポジトリ全体のデフォルトオーナー
+* @YOUR_USERNAME
+
+# ドキュメント関連
+/docs/ @YOUR_USERNAME
+
+# MCPモジュール
+/mcp/ @YOUR_USERNAME
+
+# にじボイスAPIモジュール
+/nijivoice/ @YOUR_USERNAME
+
+# ユーティリティ
+/utils/ @YOUR_USERNAME

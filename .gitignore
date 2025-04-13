@@ -1,16 +1,58 @@
-# Python-generated files
+# Python関連
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
 wheels/
-*.egg-info
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Virtual environments
-.venv
 
+# 環境設定
 .env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ログファイル
+*.log
+logs/
+
+# キャッシュファイル
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# エディタ関連
+.idea/
 .vscode/
+*.swp
+*.swo
+*~
 
+# OSファイル
+.DS_Store
+Thumbs.db
+
+# プロジェクト特有
 nijivoice_mcp.log
-
+docs/
