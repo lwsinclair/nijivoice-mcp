@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/mseep-audited.png)](https://mseep.ai/app/ryoooo-nijivoice-mcp)
+
 # NijiVoice-MCP
 
 **⚠️ 注意: このプロジェクトは開発中であり、動作未検証です。本番環境での使用は推奨されません。 ⚠️**
